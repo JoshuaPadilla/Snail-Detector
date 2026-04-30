@@ -18,13 +18,26 @@ export default function TabLayout() {
 			}}
 		>
 			<Tabs.Screen
-				name="explore"
+				name="detection"
 				options={{
 					title: "Detection",
 					tabBarIcon: ({ color }) => (
 						<IconSymbol
 							size={28}
 							name="camera.viewfinder"
+							color={color}
+						/>
+					),
+				}}
+			/>
+			<Tabs.Screen
+				name="upload"
+				options={{
+					title: "Photo",
+					tabBarIcon: ({ color }) => (
+						<IconSymbol
+							size={28}
+							name="photo.on.rectangle.angled"
 							color={color}
 						/>
 					),

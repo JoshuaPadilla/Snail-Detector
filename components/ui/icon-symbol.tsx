@@ -20,6 +20,7 @@ const MAPPING = {
 	"house.fill": "home",
 	"paperplane.fill": "send",
 	"camera.viewfinder": "center-focus-strong",
+	"photo.on.rectangle.angled": "photo-library",
 	"chevron.left.forwardslash.chevron.right": "code",
 	"chevron.right": "chevron-right",
 	"info.circle.fill": "info",
