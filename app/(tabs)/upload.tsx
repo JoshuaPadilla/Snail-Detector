@@ -1,4 +1,3 @@
-import { decodeDetections } from "@/utils/detection-model";
 import * as ImagePicker from "expo-image-picker";
 import React, { useCallback, useState } from "react";
 import {
@@ -11,9 +10,10 @@ import {
 	TouchableOpacity,
 	View,
 } from "react-native";
-import { useTensorflowModel } from "react-native-fast-tflite";
 import { loadImage } from "react-native-nitro-image";
 import MODEL from "../../assets/model/snail_detector_model.tflite";
+import { useBundledTensorflowModel } from "../../hooks/use-bundled-tensorflow-model";
+import { decodeDetections } from "../../utils/detection-model";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CONFIDENCE_THRESHOLD = 0.45;
@@ -258,7 +258,7 @@ function containRect(
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Upload() {
-	const plugin = useTensorflowModel(MODEL, []);
+	const plugin = useBundledTensorflowModel(MODEL, []);
 
 	const [imageUri, setImageUri] = useState<string | null>(null);
 	const [imageSize, setImageSize] = useState({ w: 1, h: 1 });

@@ -9,7 +9,6 @@ import {
 	View,
 	type AppStateStatus,
 } from "react-native";
-import { useTensorflowModel } from "react-native-fast-tflite";
 import {
 	Camera,
 	useCameraDevice,
@@ -20,6 +19,7 @@ import {
 } from "react-native-vision-camera";
 import { runOnJS } from "react-native-worklets";
 import MODEL from "../assets/model/snail_detector_model.tflite";
+import { useBundledTensorflowModel } from "../hooks/use-bundled-tensorflow-model";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CONFIDENCE_THRESHOLD = 0.45;
@@ -452,7 +452,7 @@ export function SnailDetectorScreen() {
 	const isCameraActive = isFocused && appState === "active";
 
 	// Load the TFLite model (CPU delegate by default).
-	const plugin = useTensorflowModel(MODEL, []);
+	const plugin = useBundledTensorflowModel(MODEL, []);
 
 	// Called on the JS thread to update detection state.
 	const onDetectionsUpdate = useCallback((dets: Detection[]) => {
