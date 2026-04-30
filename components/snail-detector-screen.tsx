@@ -17,13 +17,14 @@ import {
 	type CameraRef,
 	type Frame,
 } from "react-native-vision-camera";
-import { runOnJS } from "react-native-worklets";
+import { createSynchronizable, runOnJS } from "react-native-worklets";
 import MODEL from "../assets/model/snail_detector_model.tflite";
 import { useBundledTensorflowModel } from "../hooks/use-bundled-tensorflow-model";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CONFIDENCE_THRESHOLD = 0.45;
 const DEFAULT_INPUT_SIZE = 320;
+const LIVE_DETECTION_FRAME_STRIDE = 4;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -440,6 +441,7 @@ export function SnailDetectorScreen() {
 	const device = useCameraDevice("back");
 	const isFocused = useIsFocused();
 	const camera = useRef<CameraRef>(null);
+	const frameCounter = useRef(createSynchronizable(0)).current;
 	const lastDetectionSignature = useRef("");
 	const [appState, setAppState] = useState<AppStateStatus>(
 		AppState.currentState,
@@ -478,6 +480,14 @@ export function SnailDetectorScreen() {
 		});
 	}, []);
 
+	const commitFrameResult = useCallback(
+		(width: number, height: number, dets: Detection[]) => {
+			syncFrameSize(width, height);
+			onDetectionsUpdate(dets);
+		},
+		[onDetectionsUpdate, syncFrameSize],
+	);
+
 	const toggleTorch = useCallback(async () => {
 		if (!torchAvailable) return;
 
@@ -500,20 +510,25 @@ export function SnailDetectorScreen() {
 	const onFrame = useCallback(
 		(frame: Frame) => {
 			"worklet";
-			if (plugin.state !== "loaded" || plugin.model == null) {
+			const model = plugin.model;
+			if (plugin.state !== "loaded" || model == null) {
+				frame.dispose();
+				return;
+			}
+
+			const nextFrameCount = frameCounter.getBlocking() + 1;
+			frameCounter.setBlocking(nextFrameCount);
+			if (nextFrameCount % LIVE_DETECTION_FRAME_STRIDE !== 0) {
 				frame.dispose();
 				return;
 			}
 
 			try {
 				// Read model input shape: [batch, height, width, channels]
-				runOnJS(syncFrameSize)(frame.width, frame.height);
-				const inputH =
-					plugin.model.inputs[0]?.shape[1] ?? DEFAULT_INPUT_SIZE;
-				const inputW =
-					plugin.model.inputs[0]?.shape[2] ?? DEFAULT_INPUT_SIZE;
-				const outputShape = plugin.model.outputs[0]?.shape ?? [];
-				const outputCount = plugin.model.outputs.length;
+				const inputH = model.inputs[0]?.shape[1] ?? DEFAULT_INPUT_SIZE;
+				const inputW = model.inputs[0]?.shape[2] ?? DEFAULT_INPUT_SIZE;
+				const outputShape = model.outputs[0]?.shape ?? [];
+				const outputCount = model.outputs.length;
 
 				let tensor: Float32Array;
 
@@ -557,20 +572,21 @@ export function SnailDetectorScreen() {
 						frame.pixelFormat,
 					);
 				}
-				// Run synchronous inference.
-				const outputs = plugin.model.runSync([
-					tensor.buffer as ArrayBuffer,
-				]);
 
-				runOnJS(onDetectionsUpdate)(
-					decodeDetections(
-						outputs,
-						CONFIDENCE_THRESHOLD,
-						inputW,
-						inputH,
-						outputShape,
-						outputCount,
-					),
+				const outputs = model.runSync([tensor.buffer as ArrayBuffer]);
+				const detections = decodeDetections(
+					outputs,
+					CONFIDENCE_THRESHOLD,
+					inputW,
+					inputH,
+					outputShape,
+					outputCount,
+				);
+
+				runOnJS(commitFrameResult)(
+					frame.width,
+					frame.height,
+					detections,
 				);
 			} catch {
 				// Swallow errors to keep the frame pipeline running.
@@ -578,7 +594,7 @@ export function SnailDetectorScreen() {
 				frame.dispose();
 			}
 		},
-		[plugin, onDetectionsUpdate, syncFrameSize],
+		[commitFrameResult, frameCounter, plugin],
 	);
 
 	const previewRect = getCoverRect(

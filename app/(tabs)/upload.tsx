@@ -3,7 +3,6 @@ import React, { useCallback, useState } from "react";
 import {
 	ActivityIndicator,
 	Image,
-	SafeAreaView,
 	ScrollView,
 	StyleSheet,
 	Text,
@@ -11,6 +10,7 @@ import {
 	View,
 } from "react-native";
 import { loadImage } from "react-native-nitro-image";
+import { SafeAreaView } from "react-native-safe-area-context";
 import MODEL from "../../assets/model/snail_detector_model.tflite";
 import { useBundledTensorflowModel } from "../../hooks/use-bundled-tensorflow-model";
 import { decodeDetections } from "../../utils/detection-model";
