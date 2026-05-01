@@ -6,15 +6,15 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 1. Install dependencies
 
-   ```bash
-   npm install
-   ```
+    ```bash
+    npm install
+    ```
 
 2. Start the app
 
-   ```bash
-   npx expo start
-   ```
+    ```bash
+    npx expo start
+    ```
 
 In the output, you'll find options to open the app in a
 
@@ -41,6 +41,25 @@ To learn more about developing your project with Expo, look at the following res
 
 - [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
 - [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+
+## Backend Uploads
+
+The live detector can automatically upload a captured photo and detection metadata when it finds egg clusters.
+
+For dev testing, the upload helper is currently hardcoded to:
+
+```text
+http://localhost:3005/api/detection-logs
+```
+
+The app sends a `multipart/form-data` POST request with these fields:
+
+- `photo`: Captured JPEG image from the live camera view.
+- `eventId`: Client-generated detection event id.
+- `capturedAt`: ISO timestamp for when the detection was captured.
+- `eggClusterCount`: Number of detected egg clusters in the frame.
+- `platform`: Client platform (`android` or `ios`).
+- `metadata`: JSON payload containing detection boxes, frame size, torch state, app version, and session id.
 
 ## Join the community
 

@@ -52,7 +52,12 @@
 					}
 				}
 			],
-			"react-native-fast-tflite"
+			[
+				"react-native-fast-tflite",
+				{
+					"enableAndroidGpuLibraries": true
+				}
+			]
 		],
 		"experiments": {
 			"typedRoutes": true,

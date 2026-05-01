@@ -1,30 +1,51 @@
 import { useIsFocused } from "@react-navigation/native";
+import Constants from "expo-constants";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
 	ActivityIndicator,
 	AppState,
+	Platform,
 	StyleSheet,
 	Text,
 	TouchableOpacity,
 	View,
 	type AppStateStatus,
 } from "react-native";
+import type { TensorflowModelDelegate } from "react-native-fast-tflite";
 import {
 	Camera,
+	CommonResolutions,
+	HybridFrameConverter,
 	useCameraDevice,
 	useCameraPermission,
 	useFrameOutput,
+	usePhotoOutput,
 	type CameraRef,
 	type Frame,
 } from "react-native-vision-camera";
 import { createSynchronizable, runOnJS } from "react-native-worklets";
 import MODEL from "../assets/model/snail_detector_model.tflite";
 import { useBundledTensorflowModel } from "../hooks/use-bundled-tensorflow-model";
+import {
+	buildDetectionEventId,
+	getSnailDetectionUploadUrl,
+	uploadSnailDetectionEvent,
+	type CapturedFrameImageData,
+} from "../utils/snail-detection-upload";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CONFIDENCE_THRESHOLD = 0.45;
 const DEFAULT_INPUT_SIZE = 320;
-const LIVE_DETECTION_FRAME_STRIDE = 4;
+const LIVE_DETECTION_FALLBACK_FRAME_STRIDE = 6;
+const LIVE_DETECTION_MIN_INTERVAL_MS = 250;
+const DETECTION_UPLOAD_COOLDOWN_MS = 10_000;
+
+const LIVE_MODEL_DELEGATE_ATTEMPTS: TensorflowModelDelegate[][] =
+	Platform.OS === "android" ? [["android-gpu"], ["nnapi"], []] : [[]];
+const IS_BACKEND_UPLOAD_CONFIGURED = getSnailDetectionUploadUrl() != null;
+
+let reusableInputTensor: Float32Array | null = null;
+let reusableInputTensorLength = 0;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +56,8 @@ export interface Detection {
 	ymax: number;
 	score: number;
 }
+
+type UploadPhase = "idle" | "uploading" | "success" | "error";
 
 const DEFAULT_NMS_THRESHOLD = 0.45;
 const MAX_DETECTIONS = 8;
@@ -268,6 +291,26 @@ function decodeDetections(
 	return nonMaxSuppress(detections);
 }
 
+function normalizeFrameTimestampMs(timestamp: number): number {
+	"worklet";
+	if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+	return timestamp > 1_000_000_000 ? timestamp / 1_000_000 : timestamp * 1000;
+}
+
+function getReusableInputTensor(dstW: number, dstH: number): Float32Array {
+	"worklet";
+	const nextLength = dstW * dstH * 3;
+	if (
+		reusableInputTensor == null ||
+		reusableInputTensorLength !== nextLength
+	) {
+		reusableInputTensor = new Float32Array(nextLength);
+		reusableInputTensorLength = nextLength;
+	}
+
+	return reusableInputTensor;
+}
+
 // ─── Helpers (worklet-compatible) ─────────────────────────────────────────────
 
 /**
@@ -284,9 +327,9 @@ function buildInputTensorYUV(
 	srcH: number,
 	dstW: number,
 	dstH: number,
+	out: Float32Array,
 ): Float32Array {
 	"worklet";
-	const out = new Float32Array(dstH * dstW * 3);
 	const xScale = srcW / dstW;
 	const yScale = srcH / dstH;
 
@@ -336,6 +379,7 @@ function buildInputTensorPacked(
 	dstW: number,
 	dstH: number,
 	pixelFormat: string,
+	out: Float32Array,
 ): Float32Array {
 	"worklet";
 	let rOff: number, gOff: number, bOff: number, bpp: number;
@@ -361,7 +405,6 @@ function buildInputTensorPacked(
 		bOff = 0;
 	}
 
-	const out = new Float32Array(dstH * dstW * 3);
 	const xScale = srcW / dstW;
 	const yScale = srcH / dstH;
 
@@ -434,15 +477,51 @@ function getCoverRect(
 	};
 }
 
+function buildDetectionSignature(
+	detections: Detection[],
+	coordinateScale = 1000,
+	scoreScale = 100,
+): string {
+	"worklet";
+	return detections
+		.map(
+			(detection) =>
+				`${Math.round(detection.score * scoreScale)}:${Math.round(detection.xmin * coordinateScale)}:${Math.round(detection.ymin * coordinateScale)}:${Math.round(detection.xmax * coordinateScale)}:${Math.round(detection.ymax * coordinateScale)}`,
+		)
+		.join("|");
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function SnailDetectorScreen() {
 	const { hasPermission, requestPermission } = useCameraPermission();
 	const device = useCameraDevice("back");
+	const photoOutput = usePhotoOutput({
+		targetResolution: CommonResolutions.HD_16_9,
+		quality: 0.82,
+		qualityPrioritization: "speed",
+	});
 	const isFocused = useIsFocused();
 	const camera = useRef<CameraRef>(null);
 	const frameCounter = useRef(createSynchronizable(0)).current;
+	const lastInferenceTimestampMs = useRef(createSynchronizable(0)).current;
+	const lastCachedDetectionSignature = useRef(
+		createSynchronizable(""),
+	).current;
 	const lastDetectionSignature = useRef("");
+	const latestDetectedFrame = useRef<{
+		signature: string;
+		capturedFrameImageData: CapturedFrameImageData;
+	} | null>(null);
+	const lastUploadedSignature = useRef("");
+	const lastUploadAtMs = useRef(0);
+	const lastUploadedCount = useRef(0);
+	const lastHadDetections = useRef(false);
+	const isUploadingDetection = useRef(false);
+	const uploadPauseReason = useRef<string | null>(null);
+	const uploadSessionId = useRef(
+		`session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+	).current;
 	const [appState, setAppState] = useState<AppStateStatus>(
 		AppState.currentState,
 	);
@@ -451,24 +530,34 @@ export function SnailDetectorScreen() {
 	const [detections, setDetections] = useState<Detection[]>([]);
 	const [frameSize, setFrameSize] = useState({ width: 1, height: 1 });
 	const [layout, setLayout] = useState({ width: 1, height: 1 });
+	const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
+	const [uploadMessage, setUploadMessage] = useState<string | null>(null);
 	const isCameraActive = isFocused && appState === "active";
 
-	// Load the TFLite model (CPU delegate by default).
-	const plugin = useBundledTensorflowModel(MODEL, []);
+	// Prefer hardware acceleration on Android, but fall back cleanly.
+	const plugin = useBundledTensorflowModel(
+		MODEL,
+		LIVE_MODEL_DELEGATE_ATTEMPTS,
+	);
 
 	// Called on the JS thread to update detection state.
 	const onDetectionsUpdate = useCallback((dets: Detection[]) => {
-		const signature = dets
-			.map(
-				(d) =>
-					`${Math.round(d.score * 100)}:${Math.round(d.xmin * 1000)}:${Math.round(d.ymin * 1000)}:${Math.round(d.xmax * 1000)}:${Math.round(d.ymax * 1000)}`,
-			)
-			.join("|");
+		const signature = buildDetectionSignature(dets);
 
 		if (signature === lastDetectionSignature.current) return;
 		lastDetectionSignature.current = signature;
 		setDetections(dets);
 	}, []);
+
+	const cacheDetectedFrame = useCallback(
+		(signature: string, capturedFrameImageData: CapturedFrameImageData) => {
+			latestDetectedFrame.current = {
+				signature,
+				capturedFrameImageData,
+			};
+		},
+		[],
+	);
 
 	const syncFrameSize = useCallback((width: number, height: number) => {
 		setFrameSize((current) => {
@@ -506,6 +595,164 @@ export function SnailDetectorScreen() {
 		}
 	}, [torch, torchAvailable]);
 
+	const captureUploadPhotoUri = useCallback(async (): Promise<string> => {
+		if (Platform.OS === "android") {
+			const snapshot = await camera.current?.takeSnapshot();
+			if (snapshot != null) {
+				return snapshot.saveToTemporaryFileAsync("jpg", 92);
+			}
+		}
+
+		const photoFile = await photoOutput.capturePhotoToFile(
+			{
+				flashMode: "off",
+				enableShutterSound: false,
+			},
+			{},
+		);
+
+		return photoFile.filePath;
+	}, [photoOutput]);
+
+	const captureAndUploadDetection = useCallback(
+		async (currentDetections: Detection[]) => {
+			if (!IS_BACKEND_UPLOAD_CONFIGURED || !isCameraActive) return;
+			if (uploadPauseReason.current != null) return;
+			if (
+				currentDetections.length === 0 ||
+				isUploadingDetection.current
+			) {
+				return;
+			}
+
+			const now = Date.now();
+			const uploadSignature = buildDetectionSignature(
+				currentDetections,
+				80,
+				20,
+			);
+			const isNewBurst = !lastHadDetections.current;
+			const countIncreased =
+				currentDetections.length > lastUploadedCount.current;
+			const cooledDown =
+				now - lastUploadAtMs.current >= DETECTION_UPLOAD_COOLDOWN_MS;
+			const changedSinceLastUpload =
+				uploadSignature !== lastUploadedSignature.current;
+
+			lastHadDetections.current = true;
+
+			if (
+				!isNewBurst &&
+				!countIncreased &&
+				!(cooledDown && changedSinceLastUpload)
+			) {
+				return;
+			}
+
+			isUploadingDetection.current = true;
+			lastUploadAtMs.current = now;
+			setUploadPhase("uploading");
+			setUploadMessage("Uploading detection...");
+
+			const capturedAt = new Date().toISOString();
+
+			try {
+				const detectionSignature =
+					buildDetectionSignature(currentDetections);
+				const cachedDetectedFrame = latestDetectedFrame.current;
+				const capturedFrameImageData =
+					cachedDetectedFrame?.signature === detectionSignature
+						? cachedDetectedFrame.capturedFrameImageData
+						: undefined;
+				const photoUri = await captureUploadPhotoUri();
+
+				const result = await uploadSnailDetectionEvent({
+					eventId: buildDetectionEventId(capturedAt),
+					photoUri,
+					capturedFrameImageData,
+					capturedAt,
+					eggClusterCount: currentDetections.length,
+					detections: currentDetections,
+					metadata: {
+						cameraDeviceId: device?.id,
+						frameWidth: frameSize.width,
+						frameHeight: frameSize.height,
+						torchEnabled: torch === "on",
+						platform: Platform.OS,
+						platformVersion: String(Platform.Version),
+						appVersion: Constants.expoConfig?.version,
+						sessionId: uploadSessionId,
+					},
+				});
+
+				if (!result.ok) {
+					if (result.disabled) {
+						setUploadPhase("idle");
+						setUploadMessage("Backend upload off");
+						return;
+					}
+
+					if (result.status === 404) {
+						uploadPauseReason.current = "Upload endpoint not found";
+						setUploadPhase("error");
+						setUploadMessage("Upload endpoint not found");
+						console.warn(
+							"[DetectionUpload] Upload endpoint returned 404. Auto-upload paused until the app is reloaded or the endpoint is fixed.",
+						);
+						return;
+					}
+
+					const failureMessage =
+						result.status != null
+							? `Upload failed (${result.status})`
+							: "Upload failed";
+					setUploadPhase("error");
+					setUploadMessage(failureMessage);
+					console.warn(
+						`[DetectionUpload] ${failureMessage}${result.bodyText != null && result.bodyText.length > 0 ? `: ${result.bodyText}` : "."}`,
+					);
+					return;
+				}
+
+				lastUploadedSignature.current = uploadSignature;
+				lastUploadedCount.current = currentDetections.length;
+				setUploadPhase("success");
+				setUploadMessage(
+					`Uploaded ${new Date(capturedAt).toLocaleTimeString([], {
+						hour: "2-digit",
+						minute: "2-digit",
+					})}`,
+				);
+			} catch (error) {
+				const errorMessage =
+					error instanceof Error && error.message.length > 0
+						? error.message
+						: "Network request failed";
+				const friendlyMessage = errorMessage.includes(
+					"Network request failed",
+				)
+					? "Could not reach upload server"
+					: "Upload failed";
+				console.warn(
+					`[DetectionUpload] ${friendlyMessage}: ${errorMessage}`,
+				);
+				setUploadPhase("error");
+				setUploadMessage(friendlyMessage);
+			} finally {
+				isUploadingDetection.current = false;
+			}
+		},
+		[
+			captureUploadPhotoUri,
+			device?.id,
+			frameSize.height,
+			frameSize.width,
+			isCameraActive,
+			torch,
+			uploadSessionId,
+		],
+	);
+
 	// Frame processor worklet – runs on the camera's native thread.
 	const onFrame = useCallback(
 		(frame: Frame) => {
@@ -516,11 +763,30 @@ export function SnailDetectorScreen() {
 				return;
 			}
 
-			const nextFrameCount = frameCounter.getBlocking() + 1;
-			frameCounter.setBlocking(nextFrameCount);
-			if (nextFrameCount % LIVE_DETECTION_FRAME_STRIDE !== 0) {
-				frame.dispose();
-				return;
+			const frameTimestampMs = normalizeFrameTimestampMs(frame.timestamp);
+			if (frameTimestampMs > 0) {
+				const previousTimestampMs =
+					lastInferenceTimestampMs.getBlocking();
+				if (
+					previousTimestampMs > 0 &&
+					frameTimestampMs - previousTimestampMs <
+						LIVE_DETECTION_MIN_INTERVAL_MS
+				) {
+					frame.dispose();
+					return;
+				}
+
+				lastInferenceTimestampMs.setBlocking(frameTimestampMs);
+			} else {
+				const nextFrameCount = frameCounter.getBlocking() + 1;
+				frameCounter.setBlocking(nextFrameCount);
+				if (
+					nextFrameCount % LIVE_DETECTION_FALLBACK_FRAME_STRIDE !==
+					0
+				) {
+					frame.dispose();
+					return;
+				}
 			}
 
 			try {
@@ -530,7 +796,7 @@ export function SnailDetectorScreen() {
 				const outputShape = model.outputs[0]?.shape ?? [];
 				const outputCount = model.outputs.length;
 
-				let tensor: Float32Array;
+				const tensor = getReusableInputTensor(inputW, inputH);
 
 				if (frame.isPlanar) {
 					// YUV semi-planar (NV12/NV21) – the guaranteed Android Camera2 format.
@@ -550,7 +816,7 @@ export function SnailDetectorScreen() {
 					const yStride = yPlane.bytesPerRow;
 					const uvStride =
 						uvPlane != null ? uvPlane.bytesPerRow : yStride;
-					tensor = buildInputTensorYUV(
+					buildInputTensorYUV(
 						yBuf,
 						uvBuf,
 						yStride,
@@ -559,17 +825,19 @@ export function SnailDetectorScreen() {
 						frame.height,
 						inputW,
 						inputH,
+						tensor,
 					);
 				} else {
 					// Non-planar (BGRA/RGBA/RGB) – fallback for iOS or future formats.
 					const src = new Uint8Array(frame.getPixelBuffer());
-					tensor = buildInputTensorPacked(
+					buildInputTensorPacked(
 						src,
 						frame.width,
 						frame.height,
 						inputW,
 						inputH,
 						frame.pixelFormat,
+						tensor,
 					);
 				}
 
@@ -582,6 +850,35 @@ export function SnailDetectorScreen() {
 					outputShape,
 					outputCount,
 				);
+				const detectionSignature =
+					detections.length > 0
+						? buildDetectionSignature(detections)
+						: "";
+
+				if (detectionSignature.length === 0) {
+					if (lastCachedDetectionSignature.getBlocking() !== "") {
+						lastCachedDetectionSignature.setBlocking("");
+					}
+				} else if (
+					detectionSignature !==
+					lastCachedDetectionSignature.getBlocking()
+				) {
+					lastCachedDetectionSignature.setBlocking(
+						detectionSignature,
+					);
+					try {
+						const frameImage =
+							HybridFrameConverter.convertFrameToImage(frame);
+						const capturedFrameImageData =
+							frameImage.toEncodedImageData("jpg", 92);
+						runOnJS(cacheDetectedFrame)(
+							detectionSignature,
+							capturedFrameImageData,
+						);
+					} catch {
+						// Keep live detection running even if exact-frame capture fails.
+					}
+				}
 
 				runOnJS(commitFrameResult)(
 					frame.width,
@@ -594,7 +891,14 @@ export function SnailDetectorScreen() {
 				frame.dispose();
 			}
 		},
-		[commitFrameResult, frameCounter, plugin],
+		[
+			cacheDetectedFrame,
+			commitFrameResult,
+			frameCounter,
+			lastCachedDetectionSignature,
+			lastInferenceTimestampMs,
+			plugin,
+		],
 	);
 
 	const previewRect = getCoverRect(
@@ -603,9 +907,16 @@ export function SnailDetectorScreen() {
 		layout.width,
 		layout.height,
 	);
+	const uploadStatusLabel = !IS_BACKEND_UPLOAD_CONFIGURED
+		? "Backend upload off"
+		: (uploadMessage ??
+			(uploadPhase === "uploading"
+				? "Uploading detection..."
+				: "Auto upload armed"));
 
 	const frameOutput = useFrameOutput({
 		onFrame,
+		targetResolution: CommonResolutions.VGA_16_9,
 		// 'yuv' maps to YUV_420_888 on Android – the only format guaranteed to
 		// work alongside a preview SurfaceTexture by the Camera2 spec.
 		// 'rgb' (FLEX_RGBA_8888) is not guaranteed and causes
@@ -615,11 +926,13 @@ export function SnailDetectorScreen() {
 		// that the preview displays. Otherwise detections are in sensor-space and
 		// the overlay must manually account for frame.orientation.
 		enablePhysicalBufferRotation: true,
-		// Let the camera pick a native preview-sized resolution.
-		// Forcing 320×320 (1:1 AR) also triggers stream config rejection.
-		enablePreviewSizedOutputBuffers: true,
+		// Request a lower standard camera output that is closer to the model size
+		// than a full preview buffer, which cuts conversion and inference cost.
+		enablePreviewSizedOutputBuffers: false,
 		dropFramesWhileBusy: true,
 	});
+	const cameraOutputs =
+		Platform.OS === "android" ? [frameOutput] : [photoOutput, frameOutput];
 
 	useEffect(() => {
 		if (!hasPermission) requestPermission();
@@ -647,8 +960,21 @@ export function SnailDetectorScreen() {
 		if (!isCameraActive) {
 			setTorch("off");
 			setDetections([]);
+			lastHadDetections.current = false;
+			latestDetectedFrame.current = null;
+			lastCachedDetectionSignature.setBlocking("");
 		}
-	}, [isCameraActive]);
+	}, [isCameraActive, lastCachedDetectionSignature]);
+
+	useEffect(() => {
+		if (detections.length === 0) {
+			lastHadDetections.current = false;
+			lastUploadedCount.current = 0;
+			return;
+		}
+
+		void captureAndUploadDetection(detections);
+	}, [captureAndUploadDetection, detections]);
 
 	// ── Permission gate ──────────────────────────────────────────────────────────
 	if (!hasPermission) {
@@ -691,7 +1017,7 @@ export function SnailDetectorScreen() {
 					ref={camera}
 					style={StyleSheet.absoluteFill}
 					device={device}
-					outputs={[frameOutput]}
+					outputs={cameraOutputs}
 					isActive={isCameraActive}
 					resizeMode="cover"
 				/>
@@ -731,12 +1057,36 @@ export function SnailDetectorScreen() {
 					<Text style={styles.countLabel}>EGG CLUSTERS</Text>
 					<Text style={styles.countValue}>{detections.length}</Text>
 				</View>
-				{plugin.state === "loading" && (
-					<View style={styles.loadingChip}>
-						<ActivityIndicator size="small" color="#fff" />
-						<Text style={styles.loadingText}>Loading model…</Text>
+				<View style={styles.statusStack}>
+					{plugin.state === "loading" && (
+						<View style={styles.loadingChip}>
+							<ActivityIndicator size="small" color="#fff" />
+							<Text style={styles.loadingText}>
+								Loading model…
+							</Text>
+						</View>
+					)}
+					<View
+						style={[
+							styles.uploadChip,
+							!IS_BACKEND_UPLOAD_CONFIGURED &&
+								styles.uploadChipDisabled,
+							uploadPhase === "uploading" &&
+								styles.uploadChipUploading,
+							uploadPhase === "success" &&
+								styles.uploadChipSuccess,
+							uploadPhase === "error" && styles.uploadChipError,
+						]}
+					>
+						{uploadPhase === "uploading" &&
+							IS_BACKEND_UPLOAD_CONFIGURED && (
+								<ActivityIndicator size="small" color="#fff" />
+							)}
+						<Text style={styles.uploadText}>
+							{uploadStatusLabel}
+						</Text>
 					</View>
-				)}
+				</View>
 			</View>
 
 			{/* Bottom controls – flashlight toggle */}
@@ -860,6 +1210,10 @@ const styles = StyleSheet.create({
 		fontWeight: "700",
 		lineHeight: 42,
 	},
+	statusStack: {
+		alignItems: "flex-end",
+		gap: 10,
+	},
 	loadingChip: {
 		flexDirection: "row",
 		alignItems: "center",
@@ -875,6 +1229,38 @@ const styles = StyleSheet.create({
 		color: "rgba(255,255,255,0.7)",
 		fontSize: 12,
 		fontWeight: "500",
+	},
+	uploadChip: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: 6,
+		backgroundColor: "rgba(3, 67, 95, 0.72)",
+		borderWidth: 1,
+		borderColor: "rgba(0, 229, 255, 0.3)",
+		borderRadius: 20,
+		paddingHorizontal: 14,
+		paddingVertical: 8,
+		maxWidth: 190,
+	},
+	uploadChipDisabled: {
+		backgroundColor: "rgba(40,40,40,0.72)",
+		borderColor: "rgba(255,255,255,0.16)",
+	},
+	uploadChipUploading: {
+		backgroundColor: "rgba(0, 109, 132, 0.85)",
+	},
+	uploadChipSuccess: {
+		backgroundColor: "rgba(7, 102, 64, 0.82)",
+		borderColor: "rgba(84, 214, 44, 0.34)",
+	},
+	uploadChipError: {
+		backgroundColor: "rgba(128, 32, 32, 0.82)",
+		borderColor: "rgba(255, 120, 120, 0.34)",
+	},
+	uploadText: {
+		color: "rgba(255,255,255,0.92)",
+		fontSize: 12,
+		fontWeight: "600",
 	},
 
 	// HUD – bottom

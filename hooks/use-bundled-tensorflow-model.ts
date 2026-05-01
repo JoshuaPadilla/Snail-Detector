@@ -6,9 +6,29 @@ import {
 	type TensorflowPlugin,
 } from "react-native-fast-tflite";
 
+type DelegateAttempts = TensorflowModelDelegate[] | TensorflowModelDelegate[][];
+
+function normalizeDelegateAttempts(
+	delegateAttempts: DelegateAttempts,
+): TensorflowModelDelegate[][] {
+	const firstAttempt = (
+		delegateAttempts as (
+			| TensorflowModelDelegate
+			| TensorflowModelDelegate[]
+		)[]
+	)[0];
+
+	if (Array.isArray(firstAttempt)) {
+		const attempts = delegateAttempts as TensorflowModelDelegate[][];
+		return attempts.length > 0 ? attempts : [[]];
+	}
+
+	return [delegateAttempts as TensorflowModelDelegate[]];
+}
+
 export function useBundledTensorflowModel(
 	source: number,
-	delegates: TensorflowModelDelegate[],
+	delegateAttempts: DelegateAttempts,
 ): TensorflowPlugin {
 	const [state, setState] = useState<TensorflowPlugin>({
 		model: undefined,
@@ -32,10 +52,28 @@ export function useBundledTensorflowModel(
 					);
 				}
 
-				const model = await loadTensorflowModel(
-					{ url: uri },
-					delegates,
-				);
+				let model = undefined;
+				let lastError: unknown = undefined;
+
+				for (const delegates of normalizeDelegateAttempts(
+					delegateAttempts,
+				)) {
+					try {
+						model = await loadTensorflowModel(
+							{ url: uri },
+							delegates,
+						);
+						break;
+					} catch (error) {
+						lastError = error;
+					}
+				}
+
+				if (model == null) {
+					throw lastError instanceof Error
+						? lastError
+						: new Error("Failed to load TensorFlow model.");
+				}
 
 				if (!cancelled) {
 					setState({ model, state: "loaded" });
@@ -56,9 +94,9 @@ export function useBundledTensorflowModel(
 		return () => {
 			cancelled = true;
 		};
-		// JSON.stringify compares delegates by value.
+		// JSON.stringify compares delegate attempts by value.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [source, JSON.stringify(delegates)]);
+	}, [source, JSON.stringify(delegateAttempts)]);
 
 	return state;
 }
