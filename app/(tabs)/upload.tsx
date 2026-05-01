@@ -7,6 +7,7 @@ import {
 	StyleSheet,
 	Text,
 	TouchableOpacity,
+	useWindowDimensions,
 	View,
 } from "react-native";
 import { loadImage } from "react-native-nitro-image";
@@ -259,6 +260,7 @@ function containRect(
 
 export default function Upload() {
 	const plugin = useBundledTensorflowModel(MODEL, []);
+	const { height: windowHeight } = useWindowDimensions();
 
 	const [imageUri, setImageUri] = useState<string | null>(null);
 	const [imageSize, setImageSize] = useState({ w: 1, h: 1 });
@@ -266,6 +268,7 @@ export default function Upload() {
 	const [inferring, setInferring] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [containerSize, setContainerSize] = useState({ w: 1, h: 1 });
+	const previewHeight = Math.min(Math.max(windowHeight * 0.52, 360), 520);
 
 	const runInference = useCallback(
 		async (uri: string, imgW: number, imgH: number) => {
@@ -277,6 +280,19 @@ export default function Upload() {
 				// Load raw pixel data from the selected image.
 				const img = await loadImage({ filePath: uri });
 				const rawPixelData = await img.toRawPixelDataAsync();
+				const sourceWidth = img.width || rawPixelData.width || imgW;
+				const sourceHeight = img.height || rawPixelData.height || imgH;
+
+				setImageSize((current) => {
+					if (
+						current.w === sourceWidth &&
+						current.h === sourceHeight
+					) {
+						return current;
+					}
+
+					return { w: sourceWidth, h: sourceHeight };
+				});
 
 				const inputH =
 					plugin.model.inputs[0]?.shape[1] ?? DEFAULT_INPUT_SIZE;
@@ -286,8 +302,8 @@ export default function Upload() {
 				const src = new Uint8Array(rawPixelData.buffer);
 				const { tensor, transform } = rawToRgbFloat(
 					src,
-					rawPixelData.width,
-					rawPixelData.height,
+					sourceWidth,
+					sourceHeight,
 					rawPixelData.pixelFormat,
 					inputW,
 					inputH,
@@ -358,7 +374,7 @@ export default function Upload() {
 
 				{/* Image container + bounding-box overlay */}
 				<View
-					style={styles.imageContainer}
+					style={[styles.imageContainer, { height: previewHeight }]}
 					onLayout={(e) => {
 						const { width, height } = e.nativeEvent.layout;
 						setContainerSize({ w: width, h: height });
@@ -517,7 +533,6 @@ const styles = StyleSheet.create({
 	// Image area
 	imageContainer: {
 		width: "100%",
-		aspectRatio: 4 / 3,
 		backgroundColor: "#111",
 		borderRadius: 16,
 		overflow: "hidden",
